@@ -19,7 +19,7 @@ jobs:
           . /opt/esp/idf/export.sh
           idf.py set-target esp32c6
           idf.py build
-          idf.py merge-bin -o build/c6-wifi-zigbee-gateway-merged.bin
+          idf.py merge-bin -o c6-wifi-zigbee-gateway-merged.bin
 
       - name: Upload firmware
         uses: actions/upload-artifact@v4
