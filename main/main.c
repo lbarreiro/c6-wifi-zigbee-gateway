@@ -17,6 +17,8 @@ static esp_netif_t *ap_netif = NULL;
 static bool wifi_initialized = false;
 static volatile bool zigbee_started = false;
 static volatile bool zigbee_mainloop_exited = false;
+static volatile bool zigbee_stop_requested = false;
+static volatile esp_err_t zigbee_deinit_result = ESP_FAIL;
 
 static esp_err_t init_wifi_once(void)
 {
@@ -66,25 +68,46 @@ static esp_err_t init_zigbee_storage(void)
     return err;
 }
 
+/* This callback executes inside the Zigbee main-loop context.  Deinitializing
+   from here avoids trying to stop the mainloop from a competing task. */
+static void zigbee_stop_callback(void *ctx)
+{
+    ESP_LOGI(TAG, "[ZIGBEE] stop callback executing in mainloop");
+    zigbee_deinit_result = esp_zigbee_deinit();
+    zigbee_started = false;
+    zigbee_stop_requested = true;
+    ESP_LOGI(TAG, "[ZIGBEE] deinit from mainloop returned: %s (0x%x)",
+             esp_err_to_name(zigbee_deinit_result), zigbee_deinit_result);
+}
+
 static void zigbee_main_task(void *arg)
 {
     esp_zigbee_config_t config = {
         .platform_config = { .storage_partition_name = "zb_storage", .radio_config = { .radio_mode = ESP_ZIGBEE_RADIO_MODE_NATIVE } },
         .device_config = { .device_type = EZB_NWK_DEVICE_TYPE_ROUTER, .install_code_policy = false, .zczr_config = { .max_children = 10 } },
     };
+
     zigbee_mainloop_exited = false;
     zigbee_started = false;
+    zigbee_stop_requested = false;
+    zigbee_deinit_result = ESP_FAIL;
+
     ESP_LOGI(TAG, "[ZIGBEE] initializing");
     if (init_zigbee_storage() != ESP_OK) goto failed;
     if (esp_zigbee_init(&config) != ESP_OK) goto failed;
     if (esp_zigbee_start(false) != ESP_OK) { esp_zigbee_deinit(); goto failed; }
+
     zigbee_started = true;
     ESP_LOGI(TAG, "[ZIGBEE] ON  | Wi-Fi OFF");
-    esp_zigbee_launch_mainloop();
+
+    esp_err_t loop_err = esp_zigbee_launch_mainloop();
+    ESP_LOGI(TAG, "[ZIGBEE] mainloop returned: %s (0x%x)", esp_err_to_name(loop_err), loop_err);
+
     zigbee_started = false;
     zigbee_mainloop_exited = true;
     vTaskDelete(NULL);
     return;
+
 failed:
     zigbee_mainloop_exited = true;
     ESP_LOGE(TAG, "[ZIGBEE] failed to start");
@@ -100,25 +123,39 @@ static bool start_zigbee_and_wait(void)
         if (zigbee_mainloop_exited) return false;
         vTaskDelay(pdMS_TO_TICKS(10));
     }
+    ESP_LOGE(TAG, "[ZIGBEE] timed out waiting for start");
     return false;
 }
 
 static bool stop_zigbee_and_wait(void)
 {
     if (!zigbee_started) return true;
-    ESP_LOGI(TAG, "[ZIGBEE] OFF requested | Wi-Fi starting");
+
+    ESP_LOGI(TAG, "[ZIGBEE] OFF requested | scheduling stop callback");
+
+    /* Post the deinit into the Zigbee task itself.  The callback runs in the
+       mainloop context, where Zigbee APIs are allowed without taking the lock. */
     if (!esp_zigbee_lock_acquire(pdMS_TO_TICKS(3000))) {
-        ESP_LOGE(TAG, "[ZIGBEE] failed to acquire lock for deinit");
+        ESP_LOGE(TAG, "[ZIGBEE] failed to acquire lock to schedule stop");
         return false;
     }
-    esp_err_t err = esp_zigbee_deinit();
+    esp_err_t post_err = esp_zigbee_task_queue_post(zigbee_stop_callback, NULL);
     esp_zigbee_lock_release();
-    ESP_LOGI(TAG, "[ZIGBEE] deinit returned: %s (0x%x)", esp_err_to_name(err), err);
-    if (err != ESP_OK) return false;
+
+    if (post_err != ESP_OK) {
+        ESP_LOGE(TAG, "[ZIGBEE] failed to post stop callback: %s (0x%x)", esp_err_to_name(post_err), post_err);
+        return false;
+    }
+
     for (int i = 0; i < 500; ++i) {
-        if (zigbee_mainloop_exited) { ESP_LOGI(TAG, "[ZIGBEE] OFF confirmed"); return true; }
+        if (zigbee_mainloop_exited) {
+            ESP_LOGI(TAG, "[ZIGBEE] OFF confirmed; deinit=%s (0x%x)",
+                     esp_err_to_name(zigbee_deinit_result), zigbee_deinit_result);
+            return zigbee_deinit_result == ESP_OK;
+        }
         vTaskDelay(pdMS_TO_TICKS(10));
     }
+
     ESP_LOGE(TAG, "[ZIGBEE] timed out waiting for mainloop exit");
     return false;
 }
@@ -135,18 +172,23 @@ static void radio_test_task(void *arg)
         if (!start_zigbee_and_wait()) { ESP_LOGE(TAG, "[%03d] TEST FAILED: Zigbee did not start", cycle); goto fail; }
         ESP_LOGI(TAG, "[%03d] Zigbee stable for %d seconds", cycle, ZIGBEE_PHASE_MS / 1000);
         vTaskDelay(pdMS_TO_TICKS(ZIGBEE_PHASE_MS));
+
         if (!stop_zigbee_and_wait()) { ESP_LOGE(TAG, "[%03d] TEST FAILED: Zigbee did not stop", cycle); goto fail; }
+
         if (wifi_on() != ESP_OK) { ESP_LOGE(TAG, "[%03d] TEST FAILED: Wi-Fi did not start", cycle); goto fail; }
         ESP_LOGI(TAG, "[%03d] Wi-Fi stable for %d seconds", cycle, WIFI_PHASE_MS / 1000);
         vTaskDelay(pdMS_TO_TICKS(WIFI_PHASE_MS));
+
         if (wifi_off() != ESP_OK) { ESP_LOGE(TAG, "[%03d] TEST FAILED: Wi-Fi did not stop", cycle); goto fail; }
         ESP_LOGI(TAG, "[%03d] COMPLETE", cycle);
     }
+
     ESP_LOGI(TAG, "========================================");
     ESP_LOGI(TAG, "TEST COMPLETE: %d radio cycles without failure", RADIO_TEST_CYCLES);
     ESP_LOGI(TAG, "========================================");
     vTaskDelete(NULL);
     return;
+
 fail:
     ESP_LOGE(TAG, "========================================");
     ESP_LOGE(TAG, "TEST FAILED - stopping radio scheduler");
@@ -159,9 +201,18 @@ void app_main(void)
 {
     ESP_LOGI(TAG, "ESP32-C6 Wi-Fi + Zigbee gateway starting");
     ESP_LOGI(TAG, "Phase 5: Wi-Fi/Zigbee radio alternation test");
+
     esp_err_t ret = nvs_flash_init();
-    if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) { ESP_ERROR_CHECK(nvs_flash_erase()); ret = nvs_flash_init(); }
+    if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        ESP_ERROR_CHECK(nvs_flash_erase());
+        ret = nvs_flash_init();
+    }
     ESP_ERROR_CHECK(ret);
-    if (init_wifi_once() != ESP_OK) { ESP_LOGE(TAG, "Wi-Fi initialization failed"); return; }
+
+    if (init_wifi_once() != ESP_OK) {
+        ESP_LOGE(TAG, "Wi-Fi initialization failed");
+        return;
+    }
+
     xTaskCreate(radio_test_task, "radio_test", 6144, NULL, 5, NULL);
 }
