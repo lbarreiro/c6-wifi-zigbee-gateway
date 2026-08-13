@@ -1,4 +1,5 @@
 #include "esp_log.h"
+#include "nvs_flash.h"
 #include "esp_zigbee.h"
 #include "ezbee/bdb.h"
 #include "ezbee/app_signals.h"
@@ -39,7 +40,6 @@ static bool zigbee_signal_handler(const ezb_app_signal_t *signal)
             } else {
                 joined = false;
                 ESP_LOGW(TAG, "Zigbee steering failed: status=0x%02x; retrying", status);
-                vTaskDelay(pdMS_TO_TICKS(1000));
                 ezb_bdb_start_top_level_commissioning(EZB_BDB_MODE_NETWORK_STEERING);
             }
             break;
@@ -56,7 +56,7 @@ static void zigbee_task(void *arg)
     (void)arg;
 
     ESP_LOGI(TAG, "ESP32-C6 Zigbee-only connectivity test");
-    ESP_LOGI(TAG, "Router -> any compatible Zigbee coordinator");
+    ESP_LOGI(TAG, "Router -> any compatible coordinator");
 
     esp_zigbee_config_t config = {
         .platform_config = {
@@ -82,6 +82,14 @@ static void zigbee_task(void *arg)
 void app_main(void)
 {
     ESP_LOGI(TAG, "Zigbee-only test starting (Wi-Fi disabled)");
+
+    esp_err_t ret = nvs_flash_init();
+    if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        ESP_ERROR_CHECK(nvs_flash_erase());
+        ret = nvs_flash_init();
+    }
+    ESP_ERROR_CHECK(ret);
+    ESP_ERROR_CHECK(nvs_flash_init_partition("zb_storage"));
 
     if (xTaskCreate(zigbee_task, "zigbee_task", 6144, NULL, 5, NULL) != pdPASS) {
         ESP_LOGE(TAG, "Failed to create Zigbee task");
