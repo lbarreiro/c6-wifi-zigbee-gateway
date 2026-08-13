@@ -75,8 +75,8 @@ static void zigbee_main_task(void *arg)
     };
 
     ESP_LOGI(TAG, "Initializing Zigbee stack");
-    ESP_ERROR_CHECK(ezb_app_signal_add_handler(zigbee_app_signal_handler));
     ESP_ERROR_CHECK(esp_zigbee_init(&config));
+    ESP_ERROR_CHECK(ezb_app_signal_add_handler(zigbee_app_signal_handler));
     ESP_ERROR_CHECK(esp_zigbee_start(false));
     ESP_LOGI(TAG, "Zigbee stack started; waiting for Zigbee2MQTT Permit Join");
     esp_zigbee_launch_mainloop();
@@ -93,6 +93,8 @@ void app_main(void)
         ret = nvs_flash_init();
     }
     ESP_ERROR_CHECK(ret);
+    ESP_ERROR_CHECK(nvs_flash_init_partition("zb_storage"));
+
     if (xTaskCreate(zigbee_main_task, "zigbee_main", 6144, NULL, 5, NULL) != pdPASS) {
         ESP_LOGE(TAG, "Failed to create Zigbee task");
         return;
