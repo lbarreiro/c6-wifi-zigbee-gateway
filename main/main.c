@@ -3,12 +3,59 @@
 #include "esp_zigbee.h"
 #include "ezbee/bdb.h"
 #include "ezbee/app_signals.h"
+#include "ezbee/nwk.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
 static const char *TAG = "c6_gateway";
 #define STATUS_INTERVAL_MS 5000
+#define ZIGBEE_CHANNEL_MASK 0x07FFF800UL /* channels 11-26 */
 static volatile bool zigbee_joined = false;
+
+static void start_network_steering(void)
+{
+    ESP_LOGI(TAG, "Starting network steering");
+    ezb_bdb_start_top_level_commissioning(EZB_BDB_MODE_NETWORK_STEERING);
+}
+
+static void active_scan_callback(ezb_nwk_active_scan_result_t *result, void *user_ctx)
+{
+    (void)user_ctx;
+
+    if (result == NULL) {
+        ESP_LOGI(TAG, "Zigbee active scan finished; starting network steering");
+        start_network_steering();
+        return;
+    }
+
+    ESP_LOGI(TAG,
+             "SCAN network: channel=%u PAN=0x%04hx stack_profile=%u protocol=%u permit_join=%s router_capacity=%s",
+             result->channel_number,
+             result->panid,
+             result->stack_profile,
+             result->protocol_version,
+             result->permit_join ? "YES" : "NO",
+             result->router_capacity ? "YES" : "NO");
+}
+
+static void start_network_scan(void)
+{
+    ezb_nwk_scan_req_t req = {
+        .scan_type = EZB_NWK_SCAN_TYPE_ACTIVE,
+        .scan_duration = 5,
+        .scan_channels = ZIGBEE_CHANNEL_MASK,
+        .active_scan_cb = active_scan_callback,
+        .ed_scan_cb = NULL,
+        .user_ctx = NULL,
+    };
+
+    ESP_LOGI(TAG, "Scanning Zigbee channels 11-26 before steering");
+    ezb_err_t err = ezb_nwk_scan(&req);
+    if (err != EZB_ERR_NONE) {
+        ESP_LOGW(TAG, "Active scan request failed: 0x%x; falling back to network steering", err);
+        start_network_steering();
+    }
+}
 
 static bool zigbee_app_signal_handler(const ezb_app_signal_t *signal)
 {
@@ -27,8 +74,8 @@ static bool zigbee_app_signal_handler(const ezb_app_signal_t *signal)
             ESP_LOGI(TAG, "Zigbee startup: status=0x%02x factory_new=%s", status,
                      ezb_bdb_is_factory_new() ? "yes" : "no");
             if (status == EZB_BDB_STATUS_SUCCESS && ezb_bdb_is_factory_new()) {
-                ESP_LOGI(TAG, "Starting network steering; open Permit Join in Zigbee2MQTT");
-                ezb_bdb_start_top_level_commissioning(EZB_BDB_MODE_NETWORK_STEERING);
+                ESP_LOGI(TAG, "Open Permit Join in Zigbee2MQTT for the test");
+                start_network_scan();
             } else if (status == EZB_BDB_STATUS_SUCCESS) {
                 zigbee_joined = true;
                 ESP_LOGI(TAG, "Existing Zigbee network restored");
@@ -46,7 +93,7 @@ static bool zigbee_app_signal_handler(const ezb_app_signal_t *signal)
             } else {
                 zigbee_joined = false;
                 ESP_LOGW(TAG, "Network steering failed: status=0x%02x; retrying", status);
-                ezb_bdb_start_top_level_commissioning(EZB_BDB_MODE_NETWORK_STEERING);
+                start_network_steering();
             }
             break;
         }
