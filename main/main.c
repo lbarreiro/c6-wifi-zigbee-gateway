@@ -1,88 +1,81 @@
 #include "esp_event.h"
-#include "esp_http_server.h"
 #include "esp_log.h"
 #include "esp_netif.h"
 #include "esp_wifi.h"
 #include "nvs_flash.h"
 #include "esp_zigbee.h"
-#include "ezbee/bdb.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
-#include <stdio.h>
 
 static const char *TAG = "c6_gateway";
-static volatile bool zigbee_started = false;
 
-static void start_wifi_ap(void)
+#define RADIO_TEST_CYCLES 10
+#define ZIGBEE_PHASE_MS 10000
+#define WIFI_PHASE_MS 3000
+
+static esp_netif_t *ap_netif = NULL;
+static bool wifi_initialized = false;
+static volatile bool zigbee_started = false;
+static volatile bool zigbee_mainloop_exited = false;
+
+static esp_err_t init_wifi_once(void)
 {
+    if (wifi_initialized) {
+        return ESP_OK;
+    }
+
     ESP_ERROR_CHECK(esp_netif_init());
     ESP_ERROR_CHECK(esp_event_loop_create_default());
-    esp_netif_create_default_wifi_ap();
+    ap_netif = esp_netif_create_default_wifi_ap();
+    if (ap_netif == NULL) {
+        ESP_LOGE(TAG, "Failed to create Wi-Fi AP netif");
+        return ESP_FAIL;
+    }
+
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
     ESP_ERROR_CHECK(esp_wifi_init(&cfg));
-    wifi_config_t ap_config = { .ap = { .ssid = "C6-Zigbee-Gateway", .ssid_len = sizeof("C6-Zigbee-Gateway") - 1, .channel = 1, .password = "Beatriz77", .max_connection = 4, .authmode = WIFI_AUTH_WPA2_PSK } };
+
+    wifi_config_t ap_config = {
+        .ap = {
+            .ssid = "C6-Zigbee-Gateway",
+            .ssid_len = sizeof("C6-Zigbee-Gateway") - 1,
+            .channel = 1,
+            .password = "Beatriz77",
+            .max_connection = 4,
+            .authmode = WIFI_AUTH_WPA2_PSK,
+        },
+    };
+
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_AP));
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP, &ap_config));
-    ESP_ERROR_CHECK(esp_wifi_start());
-    ESP_LOGI(TAG, "Wi-Fi SoftAP started");
-    ESP_LOGI(TAG, "SSID: C6-Zigbee-Gateway");
-    ESP_LOGI(TAG, "AP IP: 192.168.4.1");
+    wifi_initialized = true;
+    return ESP_OK;
 }
 
-static esp_err_t status_handler(httpd_req_t *req)
+static esp_err_t wifi_on(void)
 {
-    const char *zigbee = zigbee_started ? "running" : "starting";
-    char response[192];
-    snprintf(response, sizeof(response), "{\"device\":\"C6-Zigbee-Gateway\",\"phase\":4,\"wifi\":\"softap\",\"ip\":\"192.168.4.1\",\"zigbee\":\"%s\",\"zigbee_role\":\"router\"}", zigbee);
-    httpd_resp_set_type(req, "application/json");
-    return httpd_resp_send(req, response, HTTPD_RESP_USE_STRLEN);
-}
-
-static esp_err_t join_handler(httpd_req_t *req)
-{
-    if (!zigbee_started) {
-        httpd_resp_set_status(req, "503 Service Unavailable");
-        return httpd_resp_sendstr(req, "Zigbee stack is not ready");
+    ESP_ERROR_CHECK(init_wifi_once());
+    esp_err_t err = esp_wifi_start();
+    if (err == ESP_OK) {
+        ESP_LOGI(TAG, "[WIFI] ON  | Zigbee OFF");
+    } else if (err == ESP_ERR_WIFI_STATE) {
+        ESP_LOGW(TAG, "[WIFI] already running");
+        err = ESP_OK;
+    } else {
+        ESP_LOGE(TAG, "[WIFI] start failed: %s (0x%x)", esp_err_to_name(err), err);
     }
-    esp_zigbee_lock_acquire(portMAX_DELAY);
-    ezb_err_t err = ezb_bdb_start_top_level_commissioning(EZB_BDB_MODE_NETWORK_STEERING);
-    esp_zigbee_lock_release();
-    if (err != EZB_ERR_NONE) {
-        ESP_LOGE(TAG, "Zigbee network steering failed to start: %d", err);
-        httpd_resp_set_status(req, "500 Internal Server Error");
-        return httpd_resp_sendstr(req, "Failed to start Zigbee network steering");
-    }
-    ESP_LOGI(TAG, "Zigbee network steering started from HTTP");
-    httpd_resp_set_type(req, "text/html");
-    return httpd_resp_sendstr(req, "<html><head><meta name=\"viewport\" content=\"width=device-width\"><title>C6 Zigbee Gateway</title></head><body style=\"font-family:sans-serif;max-width:600px;margin:40px auto;padding:20px\"><h1>C6 Wi-Fi + Zigbee Gateway</h1><p><b>Zigbee network steering started.</b></p><p>The C6 is now scanning for an existing Zigbee network.</p><p><a href=\"/\">Back to status</a></p></body></html>");
+    return err;
 }
 
-static esp_err_t root_handler(httpd_req_t *req)
+static esp_err_t wifi_off(void)
 {
-    const char *joined = "unknown";
-    if (zigbee_started) {
-        esp_zigbee_lock_acquire(portMAX_DELAY);
-        joined = ezb_bdb_dev_joined() ? "yes" : "no";
-        esp_zigbee_lock_release();
+    esp_err_t err = esp_wifi_stop();
+    if (err == ESP_OK || err == ESP_ERR_WIFI_NOT_STARTED) {
+        ESP_LOGI(TAG, "[WIFI] OFF | Zigbee starting");
+        return ESP_OK;
     }
-    httpd_resp_set_type(req, "text/html");
-    char response[1800];
-    snprintf(response, sizeof(response), "<!doctype html><html><head><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>C6 Zigbee Gateway</title></head><body style=\"font-family:-apple-system,BlinkMacSystemFont,sans-serif;max-width:600px;margin:30px auto;padding:20px\"><h1>C6 Wi-Fi + Zigbee Gateway</h1><p><b>Wi-Fi:</b> SoftAP — 192.168.4.1</p><p><b>Zigbee stack:</b> %s</p><p><b>Zigbee role:</b> Router</p><p><b>Joined Zigbee network:</b> %s</p><p><a href=\"/join\" style=\"display:inline-block;padding:14px 20px;background:#007aff;color:white;text-decoration:none;border-radius:10px\">Join Zigbee Network</a></p><p><a href=\"/api/status\">View JSON status</a></p></body></html>", zigbee_started ? "running" : "starting", joined);
-    return httpd_resp_send(req, response, HTTPD_RESP_USE_STRLEN);
-}
-
-static void start_http_server(void)
-{
-    httpd_config_t config = HTTPD_DEFAULT_CONFIG();
-    httpd_handle_t server = NULL;
-    ESP_ERROR_CHECK(httpd_start(&server, &config));
-    const httpd_uri_t root = { .uri = "/", .method = HTTP_GET, .handler = root_handler, .user_ctx = NULL };
-    const httpd_uri_t status = { .uri = "/api/status", .method = HTTP_GET, .handler = status_handler, .user_ctx = NULL };
-    const httpd_uri_t join = { .uri = "/join", .method = HTTP_GET, .handler = join_handler, .user_ctx = NULL };
-    ESP_ERROR_CHECK(httpd_register_uri_handler(server, &root));
-    ESP_ERROR_CHECK(httpd_register_uri_handler(server, &status));
-    ESP_ERROR_CHECK(httpd_register_uri_handler(server, &join));
-    ESP_LOGI(TAG, "HTTP server started at http://192.168.4.1/");
+    ESP_LOGE(TAG, "[WIFI] stop failed: %s (0x%x)", esp_err_to_name(err), err);
+    return err;
 }
 
 static esp_err_t init_zigbee_storage(void)
@@ -91,59 +84,200 @@ static esp_err_t init_zigbee_storage(void)
     if (err == ESP_ERR_NVS_NO_FREE_PAGES || err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
         ESP_LOGW(TAG, "Zigbee NVS storage needs reinitialization: %s", esp_err_to_name(err));
         err = nvs_flash_erase_partition("zb_storage");
-        if (err == ESP_OK) err = nvs_flash_init_partition("zb_storage");
+        if (err == ESP_OK) {
+            err = nvs_flash_init_partition("zb_storage");
+        }
     }
-    if (err != ESP_OK) ESP_LOGE(TAG, "Zigbee NVS storage initialization failed: %s (0x%x)", esp_err_to_name(err), err);
-    else ESP_LOGI(TAG, "Zigbee NVS storage initialized");
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Zigbee NVS init failed: %s (0x%x)", esp_err_to_name(err), err);
+    }
     return err;
 }
 
 static void zigbee_main_task(void *arg)
 {
-    ESP_LOGI(TAG, "Phase 4: Zigbee stack initialization");
-    esp_err_t err = init_zigbee_storage();
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "Zigbee disabled because storage initialization failed");
-        vTaskDelete(NULL);
-        return;
-    }
     esp_zigbee_config_t config = {
-        .platform_config = { .storage_partition_name = "zb_storage", .radio_config = { .radio_mode = ESP_ZIGBEE_RADIO_MODE_NATIVE } },
-        .device_config = { .device_type = EZB_NWK_DEVICE_TYPE_ROUTER, .install_code_policy = false, .zczr_config = { .max_children = 10 } },
+        .platform_config = {
+            .storage_partition_name = "zb_storage",
+            .radio_config = { .radio_mode = ESP_ZIGBEE_RADIO_MODE_NATIVE },
+        },
+        .device_config = {
+            .device_type = EZB_NWK_DEVICE_TYPE_ROUTER,
+            .install_code_policy = false,
+            .zczr_config = { .max_children = 10 },
+        },
     };
-    err = esp_zigbee_init(&config);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "esp_zigbee_init failed: %s (0x%x)", esp_err_to_name(err), err);
+
+    zigbee_mainloop_exited = false;
+    zigbee_started = false;
+
+    ESP_LOGI(TAG, "[ZIGBEE] initializing");
+
+    if (init_zigbee_storage() != ESP_OK) {
+        ESP_LOGE(TAG, "[ZIGBEE] storage failed");
+        zigbee_mainloop_exited = true;
         vTaskDelete(NULL);
         return;
     }
-    ESP_LOGI(TAG, "Zigbee stack initialized");
-    ESP_LOGI(TAG, "Zigbee role: Router");
-    ESP_LOGI(TAG, "Zigbee SDK: %s", esp_zigbee_get_version_string());
+
+    esp_err_t err = esp_zigbee_init(&config);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "[ZIGBEE] init failed: %s (0x%x)", esp_err_to_name(err), err);
+        zigbee_mainloop_exited = true;
+        vTaskDelete(NULL);
+        return;
+    }
+
     err = esp_zigbee_start(false);
     if (err != ESP_OK) {
-        ESP_LOGE(TAG, "esp_zigbee_start failed: %s (0x%x)", esp_err_to_name(err), err);
+        ESP_LOGE(TAG, "[ZIGBEE] start failed: %s (0x%x)", esp_err_to_name(err), err);
+        esp_zigbee_deinit();
+        zigbee_mainloop_exited = true;
         vTaskDelete(NULL);
         return;
     }
+
     zigbee_started = true;
-    ESP_LOGI(TAG, "Zigbee stack started");
-    ESP_LOGI(TAG, "Zigbee network join/commissioning is waiting for HTTP command");
-    esp_zigbee_launch_mainloop();
+    ESP_LOGI(TAG, "[ZIGBEE] ON  | Wi-Fi OFF");
+
+    /* Blocks until the controller deinitializes the Zigbee stack. */
+    err = esp_zigbee_launch_mainloop();
+    ESP_LOGI(TAG, "[ZIGBEE] mainloop exited: %s (0x%x)", esp_err_to_name(err), err);
+
+    zigbee_started = false;
+    zigbee_mainloop_exited = true;
+    vTaskDelete(NULL);
+}
+
+static bool start_zigbee_and_wait(void)
+{
+    zigbee_mainloop_exited = false;
+    if (xTaskCreate(zigbee_main_task, "zigbee_main", 6144, NULL, 5, NULL) != pdPASS) {
+        ESP_LOGE(TAG, "Failed to create Zigbee task");
+        return false;
+    }
+
+    const int max_wait = 500;
+    for (int i = 0; i < max_wait; ++i) {
+        if (zigbee_started) {
+            return true;
+        }
+        if (zigbee_mainloop_exited) {
+            return false;
+        }
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+
+    ESP_LOGE(TAG, "Timed out waiting for Zigbee start");
+    return false;
+}
+
+static bool stop_zigbee_and_wait(void)
+{
+    if (!zigbee_started) {
+        return true;
+    }
+
+    ESP_LOGI(TAG, "[ZIGBEE] OFF requested | Wi-Fi starting");
+
+    /* The SDK mainloop owns the Zigbee lock. Deinit from this controller task
+       releases the stack and causes esp_zigbee_launch_mainloop() to return. */
+    if (!esp_zigbee_lock_acquire(pdMS_TO_TICKS(3000))) {
+        ESP_LOGE(TAG, "Failed to acquire Zigbee lock for deinit");
+        return false;
+    }
+
+    esp_err_t err = esp_zigbee_deinit();
+    esp_zigbee_lock_release();
+
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "[ZIGBEE] deinit failed: %s (0x%x)", esp_err_to_name(err), err);
+        return false;
+    }
+
+    for (int i = 0; i < 500; ++i) {
+        if (zigbee_mainloop_exited) {
+            ESP_LOGI(TAG, "[ZIGBEE] OFF confirmed");
+            return true;
+        }
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+
+    ESP_LOGE(TAG, "Timed out waiting for Zigbee mainloop to exit");
+    return false;
+}
+
+static void radio_test_task(void *arg)
+{
+    ESP_LOGI(TAG, "========================================");
+    ESP_LOGI(TAG, "Phase 5: Radio alternation stress test");
+    ESP_LOGI(TAG, "Cycles: %d | Zigbee: %ds | Wi-Fi: %ds", RADIO_TEST_CYCLES, ZIGBEE_PHASE_MS / 1000, WIFI_PHASE_MS / 1000);
+    ESP_LOGI(TAG, "========================================");
+
+    for (int cycle = 1; cycle <= RADIO_TEST_CYCLES; ++cycle) {
+        ESP_LOGI(TAG, "[%03d] Starting Zigbee phase", cycle);
+
+        if (!start_zigbee_and_wait()) {
+            ESP_LOGE(TAG, "[%03d] TEST FAILED: Zigbee did not start", cycle);
+            goto fail;
+        }
+
+        ESP_LOGI(TAG, "[%03d] Zigbee stable for %d seconds", cycle, ZIGBEE_PHASE_MS / 1000);
+        vTaskDelay(pdMS_TO_TICKS(ZIGBEE_PHASE_MS));
+
+        if (!stop_zigbee_and_wait()) {
+            ESP_LOGE(TAG, "[%03d] TEST FAILED: Zigbee did not stop", cycle);
+            goto fail;
+        }
+
+        if (wifi_on() != ESP_OK) {
+            ESP_LOGE(TAG, "[%03d] TEST FAILED: Wi-Fi did not start", cycle);
+            goto fail;
+        }
+
+        ESP_LOGI(TAG, "[%03d] Wi-Fi stable for %d seconds", cycle, WIFI_PHASE_MS / 1000);
+        vTaskDelay(pdMS_TO_TICKS(WIFI_PHASE_MS));
+
+        if (wifi_off() != ESP_OK) {
+            ESP_LOGE(TAG, "[%03d] TEST FAILED: Wi-Fi did not stop", cycle);
+            goto fail;
+        }
+
+        ESP_LOGI(TAG, "[%03d] COMPLETE", cycle);
+    }
+
+    ESP_LOGI(TAG, "========================================");
+    ESP_LOGI(TAG, "TEST COMPLETE: %d radio cycles without failure", RADIO_TEST_CYCLES);
+    ESP_LOGI(TAG, "========================================");
+
+    /* Leave both radios stopped after the test. */
+    vTaskDelete(NULL);
+    return;
+
+fail:
+    ESP_LOGE(TAG, "========================================");
+    ESP_LOGE(TAG, "TEST FAILED - stopping radio scheduler");
+    ESP_LOGE(TAG, "========================================");
+    esp_wifi_stop();
     vTaskDelete(NULL);
 }
 
 void app_main(void)
 {
     ESP_LOGI(TAG, "ESP32-C6 Wi-Fi + Zigbee gateway starting");
-    ESP_LOGI(TAG, "Phase 4: Wi-Fi SoftAP + Zigbee network steering");
+    ESP_LOGI(TAG, "Phase 5: Wi-Fi/Zigbee radio alternation test");
+
     esp_err_t ret = nvs_flash_init();
     if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
         ESP_ERROR_CHECK(nvs_flash_erase());
         ret = nvs_flash_init();
     }
     ESP_ERROR_CHECK(ret);
-    start_wifi_ap();
-    start_http_server();
-    xTaskCreate(zigbee_main_task, "zigbee_main", 6144, NULL, 5, NULL);
+
+    if (init_wifi_once() != ESP_OK) {
+        ESP_LOGE(TAG, "Wi-Fi initialization failed");
+        return;
+    }
+
+    xTaskCreate(radio_test_task, "radio_test", 6144, NULL, 5, NULL);
 }
