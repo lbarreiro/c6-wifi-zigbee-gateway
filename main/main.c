@@ -9,7 +9,7 @@
 
 static const char *TAG = "c6_gateway";
 
-#define RADIO_TEST_CYCLES 100
+#define RADIO_TEST_CYCLES 10
 #define ZIGBEE_PHASE_MS 10000
 #define WIFI_PHASE_MS 3000
 
@@ -107,14 +107,19 @@ static bool stop_zigbee_and_wait(void)
 {
     if (!zigbee_started) return true;
     ESP_LOGI(TAG, "[ZIGBEE] OFF requested | Wi-Fi starting");
-    if (!esp_zigbee_lock_acquire(pdMS_TO_TICKS(3000))) return false;
+    if (!esp_zigbee_lock_acquire(pdMS_TO_TICKS(3000))) {
+        ESP_LOGE(TAG, "[ZIGBEE] failed to acquire lock for deinit");
+        return false;
+    }
     esp_err_t err = esp_zigbee_deinit();
     esp_zigbee_lock_release();
+    ESP_LOGI(TAG, "[ZIGBEE] deinit returned: %s (0x%x)", esp_err_to_name(err), err);
     if (err != ESP_OK) return false;
     for (int i = 0; i < 500; ++i) {
         if (zigbee_mainloop_exited) { ESP_LOGI(TAG, "[ZIGBEE] OFF confirmed"); return true; }
         vTaskDelay(pdMS_TO_TICKS(10));
     }
+    ESP_LOGE(TAG, "[ZIGBEE] timed out waiting for mainloop exit");
     return false;
 }
 
