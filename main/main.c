@@ -9,6 +9,18 @@
 static const char *TAG = "c6_gateway";
 static volatile bool joined = false;
 
+static void steering_retry_task(void *arg)
+{
+    (void)arg;
+    vTaskDelay(pdMS_TO_TICKS(1000));
+    ESP_LOGI(TAG, "Retrying Zigbee network steering");
+    esp_err_t err = ezb_bdb_start_top_level_commissioning(EZB_BDB_MODE_NETWORK_STEERING);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "Network steering retry returned: %s (0x%x)", esp_err_to_name(err), err);
+    }
+    vTaskDelete(NULL);
+}
+
 static bool zigbee_signal_handler(const ezb_app_signal_t *signal)
 {
     if (!signal) return false;
@@ -26,8 +38,10 @@ static bool zigbee_signal_handler(const ezb_app_signal_t *signal)
             ESP_LOGI(TAG, "BDB startup status=0x%02x", status);
             if (status == EZB_BDB_STATUS_SUCCESS) {
                 ESP_LOGI(TAG, "Starting Zigbee network steering");
-                ESP_ERROR_CHECK(ezb_bdb_start_top_level_commissioning(
-                    EZB_BDB_MODE_NETWORK_STEERING));
+                esp_err_t err = ezb_bdb_start_top_level_commissioning(EZB_BDB_MODE_NETWORK_STEERING);
+                if (err != ESP_OK) {
+                    ESP_LOGW(TAG, "Initial network steering returned: %s (0x%x)", esp_err_to_name(err), err);
+                }
             }
             break;
         }
@@ -40,9 +54,10 @@ static bool zigbee_signal_handler(const ezb_app_signal_t *signal)
                 ESP_LOGI(TAG, "JOINED Zigbee network");
             } else {
                 joined = false;
-                ESP_LOGW(TAG, "Zigbee steering failed: status=0x%02x; retrying", status);
-                ESP_ERROR_CHECK(ezb_bdb_start_top_level_commissioning(
-                    EZB_BDB_MODE_NETWORK_STEERING));
+                ESP_LOGW(TAG, "Zigbee steering failed: status=0x%02x", status);
+                if (xTaskCreate(steering_retry_task, "zb_retry", 3072, NULL, 4, NULL) != pdPASS) {
+                    ESP_LOGE(TAG, "Failed to schedule steering retry");
+                }
             }
             break;
         }
@@ -74,13 +89,13 @@ static void zigbee_task(void *arg)
 
     ESP_ERROR_CHECK(esp_zigbee_init(&config));
 
-    /* Follow the Espressif BDB examples: explicitly allow the full
-       Zigbee primary/secondary channel range (11-26) for discovery. */
+    /* Follow the Espressif/ESPHome BDB approach: centralized security and
+       discovery across the complete Zigbee channel range. */
     ESP_ERROR_CHECK(ezb_bdb_set_primary_channel_set(0x07FFF800));
     ESP_ERROR_CHECK(ezb_bdb_set_secondary_channel_set(0x07FFF800));
-    ESP_LOGI(TAG, "BDB channel masks: primary=0x%08lx secondary=0x%08lx",
-             (unsigned long)ezb_bdb_get_primary_channel_set(),
-             (unsigned long)ezb_bdb_get_secondary_channel_set());
+    ESP_ERROR_CHECK(ezb_bdb_set_distributed_security(false));
+    ESP_ERROR_CHECK(ezb_bdb_set_min_join_lqi(32));
+    ESP_LOGI(TAG, "BDB channel masks configured for channels 11-26");
 
     ESP_ERROR_CHECK(ezb_app_signal_add_handler(zigbee_signal_handler));
     ESP_ERROR_CHECK(esp_zigbee_start(false));
