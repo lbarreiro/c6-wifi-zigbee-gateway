@@ -69,7 +69,7 @@ static bool zigbee_app_signal_handler(const ezb_app_signal_t *signal)
                 zigbee_joined = true;
                 ESP_LOGI(TAG, "JOINED Zigbee network");
                 ESP_LOGI(TAG, "PAN=0x%04hx Channel=%d ShortAddr=0x%04hx",
-                         ezb_nwk_get_pan_id(), ezb_nwk_get_current_channel(), ezb_nwk_get_short_address());
+                         ezb_nwk_get_panid(), ezb_nwk_get_current_channel(), ezb_nwk_get_short_address());
             } else {
                 zigbee_joined = false;
                 ESP_LOGW(TAG, "Network steering failed: status=0x%02x; retrying", status);
