@@ -1,8 +1,10 @@
 #include "esp_log.h"
 #include "nvs_flash.h"
 #include "esp_zigbee.h"
+#include "ezbee/aps.h"
 #include "ezbee/bdb.h"
 #include "ezbee/app_signals.h"
+#include "ezbee/nwk.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
@@ -89,13 +91,14 @@ static void zigbee_task(void *arg)
 
     ESP_ERROR_CHECK(esp_zigbee_init(&config));
 
-    /* Follow the Espressif/ESPHome BDB approach: centralized security and
-       discovery across the complete Zigbee channel range. */
+    /* Match the ESP Zigbee SDK 2.x / ESPHome-style BDB commissioning setup. */
     ESP_ERROR_CHECK(ezb_bdb_set_primary_channel_set(0x07FFF800));
     ESP_ERROR_CHECK(ezb_bdb_set_secondary_channel_set(0x07FFF800));
-    ESP_ERROR_CHECK(ezb_bdb_set_distributed_security(false));
-    ESP_ERROR_CHECK(ezb_bdb_set_min_join_lqi(32));
+    ezb_aps_secur_enable_distributed_security(false);
+    ezb_nwk_set_min_join_lqi(32);
     ESP_LOGI(TAG, "BDB channel masks configured for channels 11-26");
+    ESP_LOGI(TAG, "Distributed security: %s", ezb_aps_secur_is_distributed_security() ? "enabled" : "disabled");
+    ESP_LOGI(TAG, "Minimum join LQI: %u", (unsigned)ezb_nwk_get_min_join_lqi());
 
     ESP_ERROR_CHECK(ezb_app_signal_add_handler(zigbee_signal_handler));
     ESP_ERROR_CHECK(esp_zigbee_start(false));
