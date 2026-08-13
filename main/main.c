@@ -5,6 +5,7 @@
 #include "esp_wifi.h"
 #include "nvs_flash.h"
 #include "esp_zigbee.h"
+#include "ezbee/bdb.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include <stdio.h>
@@ -28,7 +29,7 @@ static void start_wifi_ap(void)
     ESP_LOGI(TAG, "AP IP: 192.168.4.1");
 }
 
-static esp_err_t root_handler(httpd_req_t *req)
+static esp_err_t status_handler(httpd_req_t *req)
 {
     const char *zigbee = zigbee_started ? "running" : "starting";
     char response[192];
@@ -39,33 +40,77 @@ static esp_err_t root_handler(httpd_req_t *req)
     return httpd_resp_send(req, response, HTTPD_RESP_USE_STRLEN);
 }
 
+static esp_err_t join_handler(httpd_req_t *req)
+{
+    if (!zigbee_started) {
+        httpd_resp_set_status(req, "503 Service Unavailable");
+        return httpd_resp_sendstr(req, "Zigbee stack is not ready");
+    }
+
+    esp_zigbee_lock_acquire(portMAX_DELAY);
+    ezb_err_t err = ezb_bdb_start_top_level_commissioning(EZB_BDB_MODE_NETWORK_STEERING);
+    esp_zigbee_lock_release();
+
+    if (err != EZB_ERR_NONE) {
+        ESP_LOGE(TAG, "Zigbee network steering failed to start: %d", err);
+        httpd_resp_set_status(req, "500 Internal Server Error");
+        return httpd_resp_sendstr(req, "Failed to start Zigbee network steering");
+    }
+
+    ESP_LOGI(TAG, "Zigbee network steering started from HTTP");
+    httpd_resp_set_type(req, "text/html");
+    return httpd_resp_sendstr(req,
+        "<html><head><meta name=\"viewport\" content=\"width=device-width\"><title>C6 Zigbee Gateway</title></head>"
+        "<body style=\"font-family:sans-serif;max-width:600px;margin:40px auto;padding:20px\">"
+        "<h1>C6 Wi-Fi + Zigbee Gateway</h1>"
+        "<p><b>Zigbee network steering started.</b></p>"
+        "<p>The C6 is now scanning for an existing Zigbee network.</p>"
+        "<p><a href=\"/\">Back to status</a></p></body></html>");
+}
+
+static esp_err_t root_handler(httpd_req_t *req)
+{
+    const char *joined = "unknown";
+    esp_zigbee_lock_acquire(portMAX_DELAY);
+    joined = ezb_bdb_dev_joined() ? "yes" : "no";
+    esp_zigbee_lock_release();
+
+    httpd_resp_set_type(req, "text/html");
+    char response[1800];
+    snprintf(response, sizeof(response),
+        "<!doctype html><html><head><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>C6 Zigbee Gateway</title></head>"
+        "<body style=\"font-family:-apple-system,BlinkMacSystemFont,sans-serif;max-width:600px;margin:30px auto;padding:20px\">"
+        "<h1>C6 Wi-Fi + Zigbee Gateway</h1>"
+        "<p><b>Wi-Fi:</b> SoftAP — 192.168.4.1</p>"
+        "<p><b>Zigbee stack:</b> %s</p>"
+        "<p><b>Zigbee role:</b> Router</p>"
+        "<p><b>Joined Zigbee network:</b> %s</p>"
+        "<p><a href=\"/join\" style=\"display:inline-block;padding:14px 20px;background:#007aff;color:white;text-decoration:none;border-radius:10px\">Join Zigbee Network</a></p>"
+        "<p><a href=\"/api/status\">View JSON status</a></p>"
+        "</body></html>",
+        zigbee_started ? "running" : "starting", joined);
+    return httpd_resp_send(req, response, HTTPD_RESP_USE_STRLEN);
+}
+
 static void start_http_server(void)
 {
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     httpd_handle_t server = NULL;
     ESP_ERROR_CHECK(httpd_start(&server, &config));
+
     const httpd_uri_t root = { .uri = "/", .method = HTTP_GET, .handler = root_handler, .user_ctx = NULL };
+    const httpd_uri_t status = { .uri = "/api/status", .method = HTTP_GET, .handler = status_handler, .user_ctx = NULL };
+    const httpd_uri_t join = { .uri = "/join", .method = HTTP_GET, .handler = join_handler, .user_ctx = NULL };
+
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &root));
+    ESP_ERROR_CHECK(httpd_register_uri_handler(server, &status));
+    ESP_ERROR_CHECK(httpd_register_uri_handler(server, &join));
     ESP_LOGI(TAG, "HTTP server started at http://192.168.4.1/");
 }
 
 static void zigbee_main_task(void *arg)
 {
     ESP_LOGI(TAG, "Phase 3: Zigbee stack initialization");
-
-    esp_err_t ret = nvs_flash_init_partition("zb_storage");
-    if (ret != ESP_OK && ret != ESP_ERR_NVS_NO_FREE_PAGES && ret != ESP_ERR_NVS_NEW_VERSION_FOUND) {
-        ESP_LOGE(TAG, "Zigbee storage NVS init failed: %s", esp_err_to_name(ret));
-        ESP_LOGE(TAG, "Zigbee disabled; Wi-Fi/HTTP will remain available");
-        vTaskDelete(NULL);
-        return;
-    }
-    if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
-        ESP_LOGW(TAG, "Zigbee storage NVS needs erase; erasing and retrying");
-        ESP_ERROR_CHECK(nvs_flash_erase_partition("zb_storage"));
-        ESP_ERROR_CHECK(nvs_flash_init_partition("zb_storage"));
-    }
-
     esp_zigbee_config_t config = {
         .platform_config = {
             .storage_partition_name = "zb_storage",
@@ -78,38 +123,24 @@ static void zigbee_main_task(void *arg)
         },
     };
 
-    ret = esp_zigbee_init(&config);
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "esp_zigbee_init failed: %s (0x%x)", esp_err_to_name(ret), ret);
-        ESP_LOGE(TAG, "Zigbee disabled; Wi-Fi/HTTP will remain available");
-        vTaskDelete(NULL);
-        return;
-    }
+    ESP_ERROR_CHECK(esp_zigbee_init(&config));
     ESP_LOGI(TAG, "Zigbee stack initialized");
     ESP_LOGI(TAG, "Zigbee role: Router");
     ESP_LOGI(TAG, "Zigbee SDK: %s", esp_zigbee_get_version_string());
 
-    ret = esp_zigbee_start(false);
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "esp_zigbee_start failed: %s (0x%x)", esp_err_to_name(ret), ret);
-        ESP_LOGE(TAG, "Zigbee disabled; Wi-Fi/HTTP will remain available");
-        vTaskDelete(NULL);
-        return;
-    }
+    ESP_ERROR_CHECK(esp_zigbee_start(false));
     zigbee_started = true;
     ESP_LOGI(TAG, "Zigbee stack started");
-    ESP_LOGI(TAG, "Zigbee network join/commissioning is not started yet");
+    ESP_LOGI(TAG, "Zigbee network join/commissioning is waiting for HTTP command");
 
-    ret = esp_zigbee_launch_mainloop();
-    ESP_LOGE(TAG, "Zigbee mainloop returned: %s (0x%x)", esp_err_to_name(ret), ret);
-    zigbee_started = false;
+    esp_zigbee_launch_mainloop();
     vTaskDelete(NULL);
 }
 
 void app_main(void)
 {
     ESP_LOGI(TAG, "ESP32-C6 Wi-Fi + Zigbee gateway starting");
-    ESP_LOGI(TAG, "Phase 3: Wi-Fi SoftAP + Zigbee Router");
+    ESP_LOGI(TAG, "Phase 4: Wi-Fi SoftAP + Zigbee network steering");
 
     esp_err_t ret = nvs_flash_init();
     if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
