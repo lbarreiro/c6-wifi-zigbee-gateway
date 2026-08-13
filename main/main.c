@@ -1,66 +1,82 @@
-#include "esp_event.h"
 #include "esp_log.h"
-#include "esp_netif.h"
-#include "esp_wifi.h"
 #include "nvs_flash.h"
+#include "esp_zigbee.h"
+#include "ezbee/bdb.h"
 #include "freertos/FreeRTOS.h"
-#include "freertos/event_groups.h"
 #include "freertos/task.h"
-#include <string.h>
 
 static const char *TAG = "c6_gateway";
-#define WIFI_SSID "LB IN"
-#define WIFI_PASSWORD "Beatriz77"
 #define STATUS_INTERVAL_MS 5000
 
-static esp_netif_t *sta_netif = NULL;
-static EventGroupHandle_t wifi_event_group;
-static const EventBits_t WIFI_CONNECTED_BIT = BIT0;
-
-static void wifi_event_handler(void *arg, esp_event_base_t event_base, int32_t event_id, void *event_data)
+static esp_err_t init_zigbee_storage(void)
 {
-    if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
-        ESP_LOGI(TAG, "Wi-Fi started; connecting to %s", WIFI_SSID);
-        esp_wifi_connect();
-    } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
-        wifi_event_sta_disconnected_t *event = (wifi_event_sta_disconnected_t *)event_data;
-        xEventGroupClearBits(wifi_event_group, WIFI_CONNECTED_BIT);
-        ESP_LOGW(TAG, "Wi-Fi disconnected; reason=%d; retrying", event->reason);
-        esp_wifi_connect();
-    } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
-        ip_event_got_ip_t *event = (ip_event_got_ip_t *)event_data;
-        xEventGroupSetBits(wifi_event_group, WIFI_CONNECTED_BIT);
-        ESP_LOGI(TAG, "Wi-Fi connected, IP: " IPSTR, IP2STR(&event->ip_info.ip));
+    esp_err_t err = nvs_flash_init_partition("zb_storage");
+    if (err == ESP_ERR_NVS_NO_FREE_PAGES || err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        err = nvs_flash_erase_partition("zb_storage");
+        if (err == ESP_OK) err = nvs_flash_init_partition("zb_storage");
     }
+    if (err != ESP_OK) ESP_LOGE(TAG, "Zigbee NVS init failed: %s (0x%x)", esp_err_to_name(err), err);
+    return err;
+}
+
+static void zigbee_main_task(void *arg)
+{
+    esp_zigbee_config_t config = {
+        .platform_config = {
+            .storage_partition_name = "zb_storage",
+            .radio_config = { .radio_mode = ESP_ZIGBEE_RADIO_MODE_NATIVE },
+        },
+        .device_config = {
+            .device_type = EZB_NWK_DEVICE_TYPE_ROUTER,
+            .install_code_policy = false,
+            .zczr_config = { .max_children = 10 },
+        },
+    };
+
+    ESP_LOGI(TAG, "Zigbee-only connectivity test starting");
+    ESP_LOGI(TAG, "Zigbee initializing as Router");
+
+    if (init_zigbee_storage() != ESP_OK) {
+        ESP_LOGE(TAG, "Zigbee storage initialization failed");
+        vTaskDelete(NULL);
+        return;
+    }
+
+    esp_err_t err = esp_zigbee_init(&config);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "esp_zigbee_init failed: %s (0x%x)", esp_err_to_name(err), err);
+        vTaskDelete(NULL);
+        return;
+    }
+
+    /* Autostart enables the normal BDB startup/network-steering procedure. */
+    err = esp_zigbee_start(true);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "esp_zigbee_start failed: %s (0x%x)", esp_err_to_name(err), err);
+        vTaskDelete(NULL);
+        return;
+    }
+
+    ESP_LOGI(TAG, "Zigbee stack started; waiting for network association");
+    esp_zigbee_launch_mainloop();
+    ESP_LOGE(TAG, "Zigbee mainloop returned");
+    vTaskDelete(NULL);
 }
 
 void app_main(void)
 {
-    ESP_LOGI(TAG, "Wi-Fi-only connectivity test starting");
+    ESP_LOGI(TAG, "ESP32-C6 Zigbee-only test starting");
     ESP_ERROR_CHECK(nvs_flash_init());
-    ESP_ERROR_CHECK(esp_netif_init());
-    ESP_ERROR_CHECK(esp_event_loop_create_default());
-    sta_netif = esp_netif_create_default_wifi_sta();
-    ESP_ERROR_CHECK(esp_wifi_init(&(wifi_init_config_t)WIFI_INIT_CONFIG_DEFAULT()));
-    ESP_ERROR_CHECK(esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &wifi_event_handler, NULL));
-    ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &wifi_event_handler, NULL));
-    wifi_event_group = xEventGroupCreate();
-    if (wifi_event_group == NULL) { ESP_LOGE(TAG, "Failed to create Wi-Fi event group"); return; }
-    wifi_config_t config = {0};
-    strlcpy((char *)config.sta.ssid, WIFI_SSID, sizeof(config.sta.ssid));
-    strlcpy((char *)config.sta.password, WIFI_PASSWORD, sizeof(config.sta.password));
-    config.sta.threshold.authmode = WIFI_AUTH_WPA2_PSK;
-    config.sta.pmf_cfg.capable = true;
-    config.sta.pmf_cfg.required = false;
-    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
-    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &config));
-    ESP_ERROR_CHECK(esp_wifi_start());
 
+    if (xTaskCreate(zigbee_main_task, "zigbee_main", 6144, NULL, 5, NULL) != pdPASS) {
+        ESP_LOGE(TAG, "Failed to create Zigbee task");
+        return;
+    }
+
+    /* Status is emitted from a separate task so the Zigbee mainloop remains untouched. */
     for (uint32_t check = 1;; ++check) {
-        wifi_ap_record_t ap = {0};
-        esp_err_t err = esp_wifi_sta_get_ap_info(&ap);
-        bool connected = (err == ESP_OK) && ((xEventGroupGetBits(wifi_event_group) & WIFI_CONNECTED_BIT) != 0);
-        ESP_LOGI(TAG, "[%03lu] Wi-Fi: %s | RSSI: %d dBm", (unsigned long)check, connected ? "CONNECTED" : "DISCONNECTED", connected ? ap.rssi : 0);
+        bool joined = ezb_bdb_dev_joined();
+        ESP_LOGI(TAG, "[%03lu] Zigbee: %s", (unsigned long)check, joined ? "JOINED" : "NOT JOINED");
         vTaskDelay(pdMS_TO_TICKS(STATUS_INTERVAL_MS));
     }
 }
