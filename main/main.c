@@ -26,7 +26,8 @@ static bool zigbee_signal_handler(const ezb_app_signal_t *signal)
             ESP_LOGI(TAG, "BDB startup status=0x%02x", status);
             if (status == EZB_BDB_STATUS_SUCCESS) {
                 ESP_LOGI(TAG, "Starting Zigbee network steering");
-                ezb_bdb_start_top_level_commissioning(EZB_BDB_MODE_NETWORK_STEERING);
+                ESP_ERROR_CHECK(ezb_bdb_start_top_level_commissioning(
+                    EZB_BDB_MODE_NETWORK_STEERING));
             }
             break;
         }
@@ -40,7 +41,8 @@ static bool zigbee_signal_handler(const ezb_app_signal_t *signal)
             } else {
                 joined = false;
                 ESP_LOGW(TAG, "Zigbee steering failed: status=0x%02x; retrying", status);
-                ezb_bdb_start_top_level_commissioning(EZB_BDB_MODE_NETWORK_STEERING);
+                ESP_ERROR_CHECK(ezb_bdb_start_top_level_commissioning(
+                    EZB_BDB_MODE_NETWORK_STEERING));
             }
             break;
         }
@@ -71,6 +73,15 @@ static void zigbee_task(void *arg)
     };
 
     ESP_ERROR_CHECK(esp_zigbee_init(&config));
+
+    /* Follow the Espressif BDB examples: explicitly allow the full
+       Zigbee primary/secondary channel range (11-26) for discovery. */
+    ESP_ERROR_CHECK(ezb_bdb_set_primary_channel_set(0x07FFF800));
+    ESP_ERROR_CHECK(ezb_bdb_set_secondary_channel_set(0x07FFF800));
+    ESP_LOGI(TAG, "BDB channel masks: primary=0x%08lx secondary=0x%08lx",
+             (unsigned long)ezb_bdb_get_primary_channel_set(),
+             (unsigned long)ezb_bdb_get_secondary_channel_set());
+
     ESP_ERROR_CHECK(ezb_app_signal_add_handler(zigbee_signal_handler));
     ESP_ERROR_CHECK(esp_zigbee_start(false));
     ESP_LOGI(TAG, "Zigbee stack started; waiting for network join");
