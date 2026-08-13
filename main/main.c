@@ -20,7 +20,7 @@ static void start_wifi_ap(void)
     esp_netif_create_default_wifi_ap();
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
     ESP_ERROR_CHECK(esp_wifi_init(&cfg));
-    wifi_config_t ap_config = { .ap = { .ssid = "C6-Zigbee-Gateway", .ssid_len = sizeof("C6-Zigbee-Gateway") - 1, .channel = 1, .password = "C6Gateway", .max_connection = 4, .authmode = WIFI_AUTH_WPA2_PSK } };
+    wifi_config_t ap_config = { .ap = { .ssid = "C6-Zigbee-Gateway", .ssid_len = sizeof("C6-Zigbee-Gateway") - 1, .channel = 1, .password = "Beatriz77", .max_connection = 4, .authmode = WIFI_AUTH_WPA2_PSK } };
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_AP));
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP, &ap_config));
     ESP_ERROR_CHECK(esp_wifi_start());
