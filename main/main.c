@@ -52,6 +52,20 @@ static void start_http_server(void)
 static void zigbee_main_task(void *arg)
 {
     ESP_LOGI(TAG, "Phase 3: Zigbee stack initialization");
+
+    esp_err_t ret = nvs_flash_init_partition("zb_storage");
+    if (ret != ESP_OK && ret != ESP_ERR_NVS_NO_FREE_PAGES && ret != ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        ESP_LOGE(TAG, "Zigbee storage NVS init failed: %s", esp_err_to_name(ret));
+        ESP_LOGE(TAG, "Zigbee disabled; Wi-Fi/HTTP will remain available");
+        vTaskDelete(NULL);
+        return;
+    }
+    if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        ESP_LOGW(TAG, "Zigbee storage NVS needs erase; erasing and retrying");
+        ESP_ERROR_CHECK(nvs_flash_erase_partition("zb_storage"));
+        ESP_ERROR_CHECK(nvs_flash_init_partition("zb_storage"));
+    }
+
     esp_zigbee_config_t config = {
         .platform_config = {
             .storage_partition_name = "zb_storage",
@@ -64,17 +78,31 @@ static void zigbee_main_task(void *arg)
         },
     };
 
-    ESP_ERROR_CHECK(esp_zigbee_init(&config));
+    ret = esp_zigbee_init(&config);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "esp_zigbee_init failed: %s (0x%x)", esp_err_to_name(ret), ret);
+        ESP_LOGE(TAG, "Zigbee disabled; Wi-Fi/HTTP will remain available");
+        vTaskDelete(NULL);
+        return;
+    }
     ESP_LOGI(TAG, "Zigbee stack initialized");
     ESP_LOGI(TAG, "Zigbee role: Router");
     ESP_LOGI(TAG, "Zigbee SDK: %s", esp_zigbee_get_version_string());
 
-    ESP_ERROR_CHECK(esp_zigbee_start(false));
+    ret = esp_zigbee_start(false);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "esp_zigbee_start failed: %s (0x%x)", esp_err_to_name(ret), ret);
+        ESP_LOGE(TAG, "Zigbee disabled; Wi-Fi/HTTP will remain available");
+        vTaskDelete(NULL);
+        return;
+    }
     zigbee_started = true;
     ESP_LOGI(TAG, "Zigbee stack started");
     ESP_LOGI(TAG, "Zigbee network join/commissioning is not started yet");
 
-    esp_zigbee_launch_mainloop();
+    ret = esp_zigbee_launch_mainloop();
+    ESP_LOGE(TAG, "Zigbee mainloop returned: %s (0x%x)", esp_err_to_name(ret), ret);
+    zigbee_started = false;
     vTaskDelete(NULL);
 }
 
