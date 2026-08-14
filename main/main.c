@@ -20,10 +20,25 @@ static const char *TAG = "c6_gateway";
 #define WIFI_PASSWORD "Beatriz77"
 #define WIFI_CONNECTED_BIT BIT0
 
+typedef enum {
+    ZIGBEE_STATE_NOT_JOINED = 0,
+    ZIGBEE_STATE_RESTORED,
+    ZIGBEE_STATE_JOINED,
+} zigbee_state_t;
+
 static EventGroupHandle_t wifi_events;
-static volatile bool zigbee_joined = false;
+static volatile zigbee_state_t zigbee_state = ZIGBEE_STATE_NOT_JOINED;
 static volatile bool wifi_connected = false;
 static esp_netif_t *wifi_netif = NULL;
+
+static const char *zigbee_state_name(zigbee_state_t state)
+{
+    switch (state) {
+        case ZIGBEE_STATE_JOINED:   return "JOINED";
+        case ZIGBEE_STATE_RESTORED: return "RESTORED";
+        default:                     return "NOT JOINED";
+    }
+}
 
 static void start_network_steering(void)
 {
@@ -53,13 +68,18 @@ static bool zigbee_signal_handler(const ezb_app_signal_t *signal)
         case EZB_BDB_SIGNAL_DEVICE_REBOOT: {
             const ezb_bdb_comm_status_t status =
                 *(const ezb_bdb_comm_status_t *)ezb_app_signal_get_params(signal);
+            const bool factory_new = ezb_bdb_is_factory_new();
             ESP_LOGI(TAG, "Zigbee startup: status=0x%02x factory_new=%s",
-                     status, ezb_bdb_is_factory_new() ? "yes" : "no");
-            if (status == EZB_BDB_STATUS_SUCCESS && ezb_bdb_is_factory_new()) {
+                     status, factory_new ? "yes" : "no");
+            if (status == EZB_BDB_STATUS_SUCCESS && factory_new) {
+                zigbee_state = ZIGBEE_STATE_NOT_JOINED;
                 start_network_steering();
             } else if (status == EZB_BDB_STATUS_SUCCESS) {
-                zigbee_joined = true;
-                ESP_LOGI(TAG, "Existing Zigbee network restored");
+                /* Persisted network credentials mean the previous network was
+                   restored, but do not claim a fresh JOIN until the Zigbee
+                   stack reports a successful steering/rejoin event. */
+                zigbee_state = ZIGBEE_STATE_RESTORED;
+                ESP_LOGI(TAG, "Existing Zigbee network restored; join status not assumed");
             }
             break;
         }
@@ -68,11 +88,11 @@ static bool zigbee_signal_handler(const ezb_app_signal_t *signal)
             const ezb_bdb_comm_status_t status =
                 *(const ezb_bdb_comm_status_t *)ezb_app_signal_get_params(signal);
             if (status == EZB_BDB_STATUS_SUCCESS) {
-                zigbee_joined = true;
+                zigbee_state = ZIGBEE_STATE_JOINED;
                 ESP_LOGI(TAG, "JOINED Zigbee network | PAN=0x%04hx Channel=%d ShortAddr=0x%04hx",
                          ezb_nwk_get_panid(), ezb_nwk_get_current_channel(), ezb_nwk_get_short_address());
             } else {
-                zigbee_joined = false;
+                zigbee_state = ZIGBEE_STATE_NOT_JOINED;
                 ESP_LOGW(TAG, "Network steering failed: status=0x%02x", status);
                 if (xTaskCreate(zigbee_retry_task, "zb_retry", 3072, NULL, 4, NULL) != pdPASS) {
                     ESP_LOGE(TAG, "Failed to schedule Zigbee steering retry");
@@ -193,16 +213,16 @@ void app_main(void)
     }
 
     for (uint32_t check = 1;; ++check) {
-        uint8_t rssi = 0;
+        int8_t rssi = 0;
         wifi_ap_record_t ap = {0};
         if (wifi_connected && esp_wifi_sta_get_ap_info(&ap) == ESP_OK) {
-            rssi = (uint8_t)(ap.rssi < 0 ? -ap.rssi : ap.rssi);
+            rssi = ap.rssi;
         }
-        ESP_LOGI(TAG, "[%03lu] Wi-Fi: %s | RSSI: -%u dBm | Zigbee: %s",
+        ESP_LOGI(TAG, "[%03lu] Wi-Fi: %s | RSSI: %d dBm | Zigbee: %s",
                  (unsigned long)check,
                  wifi_connected ? "CONNECTED" : "DISCONNECTED",
-                 (unsigned)rssi,
-                 zigbee_joined ? "JOINED" : "NOT JOINED");
+                 (int)rssi,
+                 zigbee_state_name(zigbee_state));
         vTaskDelay(pdMS_TO_TICKS(STATUS_INTERVAL_MS));
     }
 }
