@@ -1,42 +1,115 @@
-#include "esp_event.h"
 #include "esp_log.h"
-#include "esp_netif.h"
-#include "esp_wifi.h"
 #include "nvs_flash.h"
+#include "esp_zigbee.h"
+#include "ezbee/aps.h"
+#include "ezbee/bdb.h"
+#include "ezbee/app_signals.h"
+#include "ezbee/nwk.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
-#include <string.h>
 
 static const char *TAG = "c6_gateway";
+static volatile bool joined = false;
 
-#define WIFI_SSID "LB IN"
-#define WIFI_PASSWORD "Beatriz77"
-#define STATUS_INTERVAL_MS 5000
+static void steering_retry_task(void *arg)
+{
+    (void)arg;
+    vTaskDelay(pdMS_TO_TICKS(1000));
+    ESP_LOGI(TAG, "Retrying Zigbee network steering");
+    esp_err_t err = ezb_bdb_start_top_level_commissioning(EZB_BDB_MODE_NETWORK_STEERING);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "Network steering retry returned: %s (0x%x)", esp_err_to_name(err), err);
+    }
+    vTaskDelete(NULL);
+}
 
-static void wifi_event_handler(void *arg, esp_event_base_t event_base,
-                               int32_t event_id, void *event_data)
+static bool zigbee_signal_handler(const ezb_app_signal_t *signal)
+{
+    if (!signal) return false;
+
+    switch (ezb_app_signal_get_type(signal)) {
+        case EZB_ZDO_SIGNAL_SKIP_STARTUP:
+            ESP_LOGI(TAG, "Zigbee ready; starting initialization");
+            ezb_bdb_start_top_level_commissioning(EZB_BDB_MODE_INITIALIZATION);
+            break;
+
+        case EZB_BDB_SIGNAL_DEVICE_FIRST_START:
+        case EZB_BDB_SIGNAL_DEVICE_REBOOT: {
+            const ezb_bdb_comm_status_t status =
+                *(const ezb_bdb_comm_status_t *)ezb_app_signal_get_params(signal);
+            ESP_LOGI(TAG, "BDB startup status=0x%02x", status);
+            if (status == EZB_BDB_STATUS_SUCCESS) {
+                ESP_LOGI(TAG, "Starting Zigbee network steering");
+                esp_err_t err = ezb_bdb_start_top_level_commissioning(EZB_BDB_MODE_NETWORK_STEERING);
+                if (err != ESP_OK) {
+                    ESP_LOGW(TAG, "Initial network steering returned: %s (0x%x)", esp_err_to_name(err), err);
+                }
+            }
+            break;
+        }
+
+        case EZB_BDB_SIGNAL_STEERING: {
+            const ezb_bdb_comm_status_t status =
+                *(const ezb_bdb_comm_status_t *)ezb_app_signal_get_params(signal);
+            if (status == EZB_BDB_STATUS_SUCCESS) {
+                joined = true;
+                ESP_LOGI(TAG, "JOINED Zigbee network");
+            } else {
+                joined = false;
+                ESP_LOGW(TAG, "Zigbee steering failed: status=0x%02x", status);
+                if (xTaskCreate(steering_retry_task, "zb_retry", 3072, NULL, 4, NULL) != pdPASS) {
+                    ESP_LOGE(TAG, "Failed to schedule steering retry");
+                }
+            }
+            break;
+        }
+
+        default:
+            break;
+    }
+    return true;
+}
+
+static void zigbee_task(void *arg)
 {
     (void)arg;
 
-    if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
-        ESP_LOGI(TAG, "Wi-Fi started; connecting to %s", WIFI_SSID);
-        ESP_ERROR_CHECK(esp_wifi_connect());
-    } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
-        const wifi_event_sta_disconnected_t *event =
-            (const wifi_event_sta_disconnected_t *)event_data;
-        ESP_LOGW(TAG, "Wi-Fi disconnected; reason=%d; retrying", event->reason);
-        esp_wifi_connect();
-    } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
-        const ip_event_got_ip_t *event = (const ip_event_got_ip_t *)event_data;
-        ESP_LOGI(TAG, "Wi-Fi connected, IP: " IPSTR, IP2STR(&event->ip_info.ip));
-    }
+    ESP_LOGI(TAG, "ESP32-C6 Zigbee-only connectivity test");
+    ESP_LOGI(TAG, "Router -> any compatible coordinator");
+
+    esp_zigbee_config_t config = {
+        .platform_config = {
+            .storage_partition_name = "zb_storage",
+            .radio_config = { .radio_mode = ESP_ZIGBEE_RADIO_MODE_NATIVE },
+        },
+        .device_config = {
+            .device_type = EZB_NWK_DEVICE_TYPE_ROUTER,
+            .install_code_policy = false,
+            .zczr_config = { .max_children = 10 },
+        },
+    };
+
+    ESP_ERROR_CHECK(esp_zigbee_init(&config));
+
+    ESP_ERROR_CHECK(ezb_bdb_set_primary_channel_set(0x07FFF800));
+    ESP_ERROR_CHECK(ezb_bdb_set_secondary_channel_set(0x07FFF800));
+    ezb_aps_secur_enable_distributed_security(false);
+    ezb_nwk_set_min_join_lqi(32);
+    ESP_LOGI(TAG, "BDB channel masks configured for channels 11-26");
+    ESP_LOGI(TAG, "Distributed security: %s", ezb_aps_secur_is_distributed_security() ? "enabled" : "disabled");
+    ESP_LOGI(TAG, "Minimum join LQI: %u", (unsigned)ezb_nwk_get_min_join_lqi());
+
+    ESP_ERROR_CHECK(ezb_app_signal_add_handler(zigbee_signal_handler));
+    ESP_ERROR_CHECK(esp_zigbee_start(false));
+    ESP_LOGI(TAG, "Zigbee stack started; waiting for network join");
+    esp_zigbee_launch_mainloop();
+    ESP_LOGE(TAG, "Zigbee mainloop stopped");
+    vTaskDelete(NULL);
 }
 
 void app_main(void)
 {
-    ESP_LOGI(TAG, "Wi-Fi-only clean connectivity test starting");
-    ESP_LOGI(TAG, "SSID: %s", WIFI_SSID);
-    ESP_LOGI(TAG, "2.4 GHz STA | all-channel scan | WPA2-Personal");
+    ESP_LOGI(TAG, "Zigbee-only test starting (Wi-Fi disabled)");
 
     esp_err_t ret = nvs_flash_init();
     if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
@@ -44,59 +117,16 @@ void app_main(void)
         ret = nvs_flash_init();
     }
     ESP_ERROR_CHECK(ret);
+    ESP_ERROR_CHECK(nvs_flash_init_partition("zb_storage"));
 
-    ESP_ERROR_CHECK(esp_netif_init());
-    ESP_ERROR_CHECK(esp_event_loop_create_default());
-    ESP_ERROR_CHECK(esp_netif_create_default_wifi_sta() != NULL ? ESP_OK : ESP_FAIL);
+    if (xTaskCreate(zigbee_task, "zigbee_task", 6144, NULL, 5, NULL) != pdPASS) {
+        ESP_LOGE(TAG, "Failed to create Zigbee task");
+        return;
+    }
 
-    wifi_init_config_t init_cfg = WIFI_INIT_CONFIG_DEFAULT();
-    ESP_ERROR_CHECK(esp_wifi_init(&init_cfg));
-
-    ESP_ERROR_CHECK(esp_event_handler_register(
-        WIFI_EVENT, ESP_EVENT_ANY_ID, &wifi_event_handler, NULL));
-    ESP_ERROR_CHECK(esp_event_handler_register(
-        IP_EVENT, IP_EVENT_STA_GOT_IP, &wifi_event_handler, NULL));
-
-    /* Explicitly use the Portuguese regulatory domain so channel scanning
-       matches the normal 2.4 GHz channels used by the home network. */
-    wifi_country_t country = {
-        .cc = "PT",
-        .schan = 1,
-        .nchan = 13,
-        .policy = WIFI_COUNTRY_POLICY_MANUAL,
-    };
-    ESP_ERROR_CHECK(esp_wifi_set_country(&country));
-
-    wifi_config_t config = {0};
-    strlcpy((char *)config.sta.ssid, WIFI_SSID, sizeof(config.sta.ssid));
-    strlcpy((char *)config.sta.password, WIFI_PASSWORD, sizeof(config.sta.password));
-
-    config.sta.scan_method = WIFI_ALL_CHANNEL_SCAN;
-    config.sta.sort_method = WIFI_CONNECT_AP_BY_SIGNAL;
-    config.sta.threshold.authmode = WIFI_AUTH_WPA2_PSK;
-    config.sta.pmf_cfg.capable = true;
-    config.sta.pmf_cfg.required = false;
-
-    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
-    ESP_ERROR_CHECK(esp_wifi_set_protocol(
-        WIFI_IF_STA, WIFI_PROTOCOL_11B | WIFI_PROTOCOL_11G | WIFI_PROTOCOL_11N));
-    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &config));
-    ESP_ERROR_CHECK(esp_wifi_start());
-
-    for (uint32_t check = 1;; ++check) {
-        wifi_ap_record_t ap = {0};
-        esp_err_t err = esp_wifi_sta_get_ap_info(&ap);
-        bool connected = (err == ESP_OK);
-
-        if (connected) {
-            ESP_LOGI(TAG, "[%03lu] Wi-Fi: CONNECTED | RSSI: %d dBm | Channel: %d | BSSID: %02x:%02x:%02x:%02x:%02x:%02x",
-                     (unsigned long)check, ap.rssi, ap.primary,
-                     ap.bssid[0], ap.bssid[1], ap.bssid[2],
-                     ap.bssid[3], ap.bssid[4], ap.bssid[5]);
-        } else {
-            ESP_LOGI(TAG, "[%03lu] Wi-Fi: DISCONNECTED", (unsigned long)check);
-        }
-
-        vTaskDelay(pdMS_TO_TICKS(STATUS_INTERVAL_MS));
+    for (uint32_t n = 1;; ++n) {
+        ESP_LOGI(TAG, "[%03lu] Zigbee: %s", (unsigned long)n,
+                 joined ? "JOINED" : "NOT JOINED");
+        vTaskDelay(pdMS_TO_TICKS(5000));
     }
 }
